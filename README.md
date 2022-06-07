@@ -17,5 +17,5 @@ Following defenses were evaluated:
 Two white-box attacks and two black-box attacks with $\ell_{\infty}$ and $\ell_2$ norm were used to evaluate defenses, which can be found in the file ``` attack_lib.py ```. 
 
 ## Evaluation
-The file ``` evaluation.py ``` can be used for evaluation after model trained with defense. For example, the evaluation of EEGNet trained with AT against $\ell_{\infty}$ untargeted attacks in within-subject setup is as follows:
+The file ``` evaluation.py ``` can be used for evaluation after model trained with defense. For example, the evaluation of EEGNet trained with AT against $\ell_{\infty}$ untargeted attacks in within-subject setup is as follows:  
 ``` python3 evaluation.py --model EEGNet --defense AT --distance inf --target False ```
