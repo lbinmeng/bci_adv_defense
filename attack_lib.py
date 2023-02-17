@@ -2,11 +2,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import torch.nn.functional as F
 from tqdm import tqdm
 from typing import Optional
 from model import EEGNet
-from utils.pytorch_utils import init_weights
+from utils.pytorch_utils import init_weights, CenterLoss
 from torch.utils.data import TensorDataset, DataLoader
+from utils.ot import sinkhorn_loss_joint_IPOT
 
 
 def FGSM(model: nn.Module,
@@ -156,6 +158,72 @@ def PGD_batch(model: nn.Module,
         delta = torch.clamp(adv_x - x, min=-eps, max=eps)
         adv_x = (x + delta).detach()
 
+    return adv_x
+
+
+def maximize_shift_inconsistency(model: nn.Module,
+              batch_adv_x: torch.Tensor,
+              x: torch.Tensor,
+              y: torch.Tensor,
+              criterion: nn.Module,
+              eps: Optional[float] = 0.05,
+              alpha: Optional[float] = 0.005,
+              steps: Optional[int] = 20):
+    device = next(model.parameters()).device
+
+    model.eval()
+    batch_adv_x = batch_adv_x.clone().detach().to(device)
+    x = x.clone().detach().to(device)
+    y = y.clone().detach().to(device)
+    for _ in range(steps):
+        batch_adv_x.requires_grad = True
+        with torch.enable_grad():
+            loss = criterion(model(batch_adv_x) - model(x), y)
+        grad = torch.autograd.grad(loss,
+                                batch_adv_x,
+                                retain_graph=False,
+                                create_graph=False)[0]
+        batch_adv_x = batch_adv_x.detach() + 0.4 * alpha * grad.detach().sign()
+        # projection
+        delta = torch.clamp(batch_adv_x - x, min=-eps, max=eps)
+        batch_adv_x = (x + delta).detach()
+    
+    return batch_adv_x
+
+
+def feature_scatter(model: nn.Module,
+                    x: torch.Tensor,
+                    y: torch.Tensor,
+                    eps: Optional[float] = 0.05,
+                    alpha: Optional[float] = 0.005,
+                    steps: Optional[int] = 20):
+    device = next(model.parameters()).device
+
+    model.eval()
+    x = x.clone().detach().to(device)
+    y = y.clone().detach().to(device)
+
+    logits = model(x)
+    m, n = len(x), len(x)
+
+    # craft adversarial examples
+    adv_x = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+    for _ in range(steps):
+        adv_x.requires_grad = True
+        adv_logits = model(adv_x)
+        with torch.enable_grad():
+            loss = sinkhorn_loss_joint_IPOT(1, 0.00, logits,
+                                                  adv_logits, None, None,
+                                                  0.01, m, n)
+        grad = torch.autograd.grad(loss,
+                                   adv_x,
+                                   retain_graph=False,
+                                   create_graph=False)[0]
+        adv_x = adv_x.detach() + alpha * grad.detach().sign()
+        # projection
+        delta = torch.clamp(adv_x - x, min=-eps, max=eps)
+        adv_x = (x + delta).detach()
+    
     return adv_x
 
 
@@ -331,3 +399,147 @@ def TrainSub(model: nn.Module, x_sub: torch.Tensor, y_sub: torch.Tensor,
             del adv_x, adv_y
 
     return sub_model
+
+
+class RayS(object):
+    def __init__(self, model, epsilon=0.031, order=np.inf):
+        self.model = model
+        self.ord = order
+        self.epsilon = epsilon
+        self.sgn_t = None
+        self.d_t = None
+        self.x_final = None
+        self.queries = None
+        self.device = next(model.parameters()).device
+
+    def get_xadv(self, x, v, d, lb=0., ub=1.):
+        if isinstance(d, int):
+            d = torch.tensor(d).repeat(len(x)).to(self.device)
+        out = x + d.view(len(x), 1, 1, 1) * v
+        out = torch.clamp(out, lb, ub)
+        return out
+
+    def attack_hard_label(self, x, y, target=None, query_limit=10000, seed=None):
+        """ Attack the original image and return adversarial example
+            model: (pytorch model)
+            (x, y): original image
+        """
+        shape = list(x.shape)
+        dim = np.prod(shape[1:])
+        lb, ub = x.min(), x.max()
+        if seed is not None:
+            np.random.seed(seed)
+
+        # init variables
+        self.queries = torch.zeros_like(y).to(self.device)
+        self.sgn_t = torch.sign(torch.ones(shape)).to(self.device)
+        self.d_t = torch.ones_like(y).float().fill_(float("Inf")).to(self.device)
+        working_ind = (self.d_t > self.epsilon).nonzero().flatten()
+
+        stop_queries = self.queries.clone()
+        dist = self.d_t.clone()
+        self.x_final = self.get_xadv(x, self.sgn_t, self.d_t, lb, ub)
+ 
+        block_level = 0
+        block_ind = 0
+        for i in range(query_limit):
+            block_num = 2 ** block_level
+            block_size = int(np.ceil(dim / block_num))
+            start, end = block_ind * block_size, min(dim, (block_ind + 1) * block_size)
+
+            valid_mask = (self.queries < query_limit) 
+            attempt = self.sgn_t.clone().view(shape[0], dim)
+            attempt[valid_mask.nonzero().flatten(), start:end] *= -1.
+            attempt = attempt.view(shape)
+
+            self.binary_search(x, y, target, attempt, valid_mask)
+
+            block_ind += 1
+            if block_ind == 2 ** block_level or end == dim:
+                block_level += 1
+                block_ind = 0
+
+            dist = torch.norm((self.x_final - x).view(shape[0], -1), self.ord, 1)
+            stop_queries[working_ind] = self.queries[working_ind]
+            working_ind = (dist > self.epsilon).nonzero().flatten()
+
+            if torch.sum(self.queries >= query_limit) == shape[0]:
+                print('out of queries')
+                break
+
+            print('d_t: %.4f | adbd: %.4f | queries: %.4f | rob acc: %.4f | iter: %d'
+                   % (torch.mean(self.d_t), torch.mean(dist), torch.mean(self.queries.float()),
+                      len(working_ind) / len(x), i + 1))
+ 
+
+        stop_queries = torch.clamp(stop_queries, 0, query_limit)
+        return self.x_final, stop_queries, dist, (dist <= self.epsilon)
+    
+
+    def attack_batch(self, x, y, target=None, query_limit=5000, seed=None):
+        data_loader = DataLoader(dataset=TensorDataset(x, target if target!=None else y),
+                             batch_size=1024,
+                             shuffle=False,
+                             drop_last=False)
+
+        for step, (batch_x, batch_y) in enumerate(data_loader):
+            batch_x = batch_x.clone().detach().to(self.device)
+            batch_y = batch_y.clone().detach().to(self.device)
+
+            batch_adv_x, _, _, _ = self.attack_hard_label(batch_x, batch_y, target=batch_y if target!=None else None, query_limit=query_limit)
+            
+            # projection
+            if self.ord == np.inf:
+                delta = torch.clamp(batch_adv_x - batch_x, min=-self.epsilon, max=self.epsilon)
+            else:
+                delta = batch_adv_x - batch_x
+                delta_norms = torch.norm(delta.view(len(batch_x), -1),
+                                         p=2,
+                                         dim=1)
+                factor = torch.min(self.epsilon / delta_norms,
+                                   torch.ones_like(delta_norms))
+                delta = delta * factor.view(-1, 1, 1, 1)
+
+            batch_adv_x = (batch_x + delta).detach()
+
+            if step == 0: adv_x = batch_adv_x
+            else: adv_x = torch.cat([adv_x, batch_adv_x], dim=0)
+
+        return adv_x.cpu()
+
+    # check whether solution is found
+    def search_succ(self, x, y, target, mask):
+        self.queries[mask] += 1
+        if target!=None:
+            return self.model.predict_label(x[mask]) == target[mask]
+        else:
+            return self.model.predict_label(x[mask]) != y[mask]
+
+    # binary search for decision boundary along sgn direction
+    def binary_search(self, x, y, target, sgn, valid_mask, tol=1e-3):
+        lb, ub = x.min(), x.max()
+        sgn_norm = torch.norm(sgn.view(len(x), -1), 2, 1)
+        sgn_unit = sgn / sgn_norm.view(len(x), 1, 1, 1)
+
+        d_start = torch.zeros_like(y).float().to(self.device)
+        d_end = self.d_t.clone()
+
+        initial_succ_mask = self.search_succ(self.get_xadv(x, sgn_unit, self.d_t, lb, ub), y, target, valid_mask)
+        to_search_ind = valid_mask.nonzero().flatten()[initial_succ_mask]
+        d_end[to_search_ind] = torch.min(self.d_t, sgn_norm)[to_search_ind]
+
+        while len(to_search_ind) > 0:
+            d_mid = (d_start + d_end) / 2.0
+            search_succ_mask = self.search_succ(self.get_xadv(x, sgn_unit, d_mid, lb, ub), y, target, to_search_ind)
+            d_end[to_search_ind[search_succ_mask]] = d_mid[to_search_ind[search_succ_mask]]
+            d_start[to_search_ind[~search_succ_mask]] = d_mid[to_search_ind[~search_succ_mask]]
+            to_search_ind = to_search_ind[((d_end - d_start)[to_search_ind] > tol)]
+
+        to_update_ind = (d_end < self.d_t).nonzero().flatten()
+        if len(to_update_ind) > 0:
+            self.d_t[to_update_ind] = d_end[to_update_ind]
+            self.x_final[to_update_ind] = self.get_xadv(x, sgn_unit, d_end, lb, ub)[to_update_ind]
+            self.sgn_t[to_update_ind] = sgn[to_update_ind]
+
+    def __call__(self, data, label, target=None, query_limit=10000):
+        return self.attack_hard_label(data, label, target=target, query_limit=query_limit)

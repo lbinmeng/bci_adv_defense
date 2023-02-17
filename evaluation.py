@@ -16,6 +16,9 @@ from utils.data_loader import MI4CLoad, ERNLoad, EPFLLoad, split
 from utils.pytorch_utils import init_weights, print_args, seed, weight_for_balanced_classes, bca_score, CustomTensorDataset
 from pruning import pruning_by_ratio
 from sklearn.metrics import accuracy_score
+from utils.autoattack import AutoAttack
+from utils.pytorch_utils import GeneralTorchModel
+
 
 
 def load_target_model(x: torch.Tensor, y: torch.Tensor, model_path: str, args):
@@ -115,16 +118,17 @@ def evaluation(x_sub: torch.Tensor, y_sub: torch.Tensor, x_test: torch.Tensor,
     clean_preds, clean_labels = eval(model, criterion, test_loader)
     test_acc = accuracy_score(clean_labels, clean_preds)
 
-    sub_model = attack_lib.TrainSub(model,
-                                    x_sub=x_sub,
-                                    y_sub=y_sub,
-                                    aug_repeat=2)
+    # sub_model = attack_lib.TrainSub(model,
+    #                                 x_sub=x_sub,
+    #                                 y_sub=y_sub,
+    #                                 aug_repeat=2)
 
     # attack
     if args.target: adv_label = torch.zeros_like(y_test)
     else: adv_label = y_test 
     eps_list = [0.01, 0.05, 0.1] if args.distance == 'inf' else [1.0, 1.5, 2.0]
-    attack_list = ['PGD', 'FGSM', 'Sub', 'Sim']
+    attack_list = ['Rays']
+    # attack_list = ['PGD', 'FGSM', 'Sub', 'Sim']
     adv_accs = []
     for eps in eps_list:
         adv_acc_list = []
@@ -163,6 +167,19 @@ def evaluation(x_sub: torch.Tensor, y_sub: torch.Tensor, x_test: torch.Tensor,
                                          eps=eps,
                                          distance=args.distance,
                                          target=args.target)
+            elif attack == 'Rays':
+                torch_model = GeneralTorchModel(model, n_class=len(np.unique(y_sub.numpy())), im_mean=None, im_std=None)
+                adversary = attack_lib.RayS(torch_model, epsilon=eps, order=np.inf if args.distance == 'inf' else 2)
+                adv_x = adversary.attack_batch(x_test, y_test, target=adv_label if args.target else None, query_limit=2000)
+
+            elif attack == 'AutoAttack':
+                adversary = AutoAttack(model, 
+                                       'Linf' if args.distance == 'inf' else 'L2', 
+                                       eps=eps, 
+                                       version='standard', 
+                                       device=args.device)
+                adv_x = adversary.run_standard_evaluation(x_test, adv_label, bs=args.batch_size)
+
             adv_loader = DataLoader(dataset=TensorDataset(adv_x.cpu(), y_test),
                                     batch_size=args.batch_size,
                                     shuffle=False,
@@ -270,9 +287,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--setup', type=str, default='within')
 
-    parser.add_argument('--defense', type=str, default='self_ensembel_AT')
-    parser.add_argument('--distance', type=str, default='inf')
-    parser.add_argument('--target', type=bool, default=True)
+    parser.add_argument('--defense', type=str, default='SCR')
+    parser.add_argument('--distance', type=str, default='l2')
+    parser.add_argument('--target', type=bool, default=False)
 
     args = parser.parse_args()
 
@@ -289,12 +306,12 @@ if __name__ == '__main__':
     ]
 
     if args.transform:
-        log_path = f'result_{args.distance}_new/log/input_transform/{args.defense}'
-        npz_path = f'result_{args.distance}_new/npz/input_transform/{args.defense}/{args.setup}_{args.dataset}_{args.model}'
+        log_path = f'result_{args.distance}_revised/Rays/log/input_transform/{args.defense}'
+        npz_path = f'result_{args.distance}_revised/Rays/npz/input_transform/{args.defense}/{args.setup}_{args.dataset}_{args.model}'
         model_path = f'model/input_transform/{args.defense}/target/{args.dataset}/{args.model}/{args.setup}'
     else:
-        log_path = f'result_{args.distance}_new/log/{args.defense}'
-        npz_path = f'result_{args.distance}_new/npz/{args.defense}/{args.setup}_{args.dataset}_{args.model}'
+        log_path = f'result_{args.distance}_revised/Rays/log/{args.defense}'
+        npz_path = f'result_{args.distance}_revised/Rays/npz/{args.defense}/{args.setup}_{args.dataset}_{args.model}'
         model_path = f'model/{args.defense}/target/{args.dataset}/{args.model}/{args.setup}'
 
     
@@ -360,6 +377,7 @@ if __name__ == '__main__':
             x_test = Variable(torch.from_numpy(x_test).type(torch.FloatTensor))
             y_test = Variable(torch.from_numpy(y_test).type(torch.LongTensor))
 
+
             test_acc, adv_acc = evaluation(x_val, y_val, x_test, y_test,
                                       model_save_path, args)
             acc_list.append(test_acc)
@@ -379,7 +397,9 @@ if __name__ == '__main__':
     # [repeat, subject, eps, attack]
     r_acc, r_adv_acc = np.mean(r_acc, axis=1), np.mean(r_adv_acc, axis=1)
     r_adv_acc = np.array(r_adv_acc)
-    attack_list = ['PGD', 'FGSM', 'Sub', 'Sim']
+    attack_list = ['Rays']
+    # ['PGD', 'FGSM', 'Sub', 'Sim', 'Rays', 'AutoAttack']
+    # attack_list = ['PGD', 'FGSM', 'Sub', 'Sim']
     eps_list = [0.01, 0.05, 0.1]
     logging.info(f'Repeat mean acc: {round(np.mean(r_acc), 4)}-{round(np.std(r_acc), 4)}')
     for i, eps in enumerate(eps_list):

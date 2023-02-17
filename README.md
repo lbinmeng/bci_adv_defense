@@ -7,6 +7,7 @@ Following defenses were evaluated:
 - Natural training: ``` NT.py ```
 - Adversarial training: ``` AT.py ```
 - TRADES: ``` TRADES.py ```
+- SCR: ```SRC.py```
 - HYDRA: ``` HYDRA.py ```
 - Stochastic activation pruning: ``` stochastic_activation_pruning.py ```
 - Input transformation: ``` input_transform.py ```

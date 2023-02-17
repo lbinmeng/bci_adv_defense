@@ -9,6 +9,132 @@ from typing import Optional
 from torch.optim import optimizer
 from collections import OrderedDict
 
+
+def diff_in_weights(model: nn.Module, proxy: nn.Module):
+    diff_dict = OrderedDict()
+    model_state_dict = model.state_dict()
+    proxy_state_dict = proxy.state_dict()
+    for (old_k, old_w), (new_k, new_w) in zip(model_state_dict.items(),
+                                              proxy_state_dict.items()):
+        if len(old_w.size()) <= 1:
+            continue
+        if 'weight' in old_k:
+            diff_w = new_w - old_w
+            diff_dict[old_k] = old_w.norm() / (diff_w.norm() + 1e-20) * diff_w
+    return diff_dict
+
+
+def add_into_weights(model: nn.Module,
+                     diff: OrderedDict,
+                     coeff: Optional[float] = 1.0):
+    names_in_diff = diff.keys()
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in names_in_diff:
+                param.add_(coeff * diff[name])
+
+
+def tradesLoss(model: nn.Module,
+               x: torch.Tensor,
+               y: torch.Tensor,
+               optimizer: optimizer,
+               epoch: int,
+               eps: Optional[float] = 0.05,
+               alpha: Optional[float] = 0.005,
+               steps: Optional[int] = 20,
+               distance: Optional[str] = 'l_inf',
+               beta: Optional[float] = 1.0,
+               awp: Optional[bool] = False,
+               gamma: Optional[float] = 0.005):
+    """ trades loss """
+    device = next(model.parameters()).device
+    # KL loss
+    criterion_kl = nn.KLDivLoss(reduction='sum').to(device)
+    criterion_cal = nn.CrossEntropyLoss().to(device)
+    batch_size = len(x)
+
+    # generate adversarial example, PGD for l_inf, optimize for l_2
+    model.eval()
+    adv_x = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
+    if distance == 'l_inf':
+        for _ in range(steps):
+            adv_x.requires_grad = True
+            with torch.enable_grad():
+                loss_kl = criterion_kl(F.log_softmax(model(adv_x), dim=1),
+                                       F.softmax(model(x), dim=1))
+            grad = torch.autograd.grad(loss_kl,
+                                       adv_x,
+                                       retain_graph=False,
+                                       create_graph=False)[0]
+            adv_x = adv_x.detach() + alpha * grad.detach().sign()
+            # projection
+            delta = torch.clamp(adv_x - x, min=-eps, max=eps)
+            adv_x = (x + delta).detach()
+    elif distance == 'l_2':
+        delta = 0.001 * torch.randn(x.shape).detach().to(device)
+        delta = Variable(delta.data, requires_grad=True)
+
+        # setup optimizer
+        optimizer_delta = optim.SGD([delta], lr=eps / steps * 2)
+        for _ in range(steps):
+            adv_x = x + delta
+            # optimize
+            optimizer_delta.zero_grad()
+            with torch.enable_grad():
+                loss = (-1) * criterion_kl(F.log_softmax(model(adv_x), dim=1),
+                                           F.softmax(model(x), dim=1))
+            loss.backward()
+            # renorm gradient
+            grad_norms = delta.grad.view(batch_size, -1).norm(p=2, dim=1)
+            delta.grad.div_(grad_norms.view(-1, 1, 1, 1))
+            if (grad_norms == 0).any():
+                delta.grad[grad_norms == 0] = torch.rand_like(
+                    delta.grad[grad_norms == 0])
+            optimizer_delta.step()
+            # projection
+            delta.data.renorm_(p=2, dim=0, maxnorm=eps)
+        adv_x = (x + delta).detach()
+    else:
+        raise f'No {distance} distance'
+
+    # cal awp
+    if awp and epoch >= 10:
+        proxy = copy.deepcopy(model)
+        proxy_optimizer = optim.SGD(proxy.parameters(), lr=0.001)
+        proxy.train()
+
+        l_cal = criterion_cal(proxy(x), y)
+        l_rob = (1.0 / batch_size) * criterion_kl(
+            F.log_softmax(proxy(adv_x), dim=1), F.softmax(proxy(x), dim=1))
+        l = -1.0 * (l_cal + beta * l_rob)
+        proxy_optimizer.zero_grad()
+        l.backward()
+        proxy_optimizer.step()
+        # the adversary weight perturb
+        diff = diff_in_weights(model, proxy)
+        # add the weight perturb
+        add_into_weights(model, diff, coeff=1.0 * gamma)
+
+    # cal loss
+    model.train()
+    adv_logits = model(adv_x)
+    logits = model(x)
+
+    loss_cal = criterion_cal(logits, y)
+    loss_rob = (1.0 / batch_size) * criterion_kl(
+        F.log_softmax(adv_logits, dim=1), F.softmax(logits, dim=1))
+    loss = loss_cal + beta * loss_rob
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if awp and epoch >= 10:
+        add_into_weights(model, diff, coeff=-1.0 * gamma)
+
+    return loss.item()
+
+
 class LabelSmoothLoss(nn.Module):
     def __init__(self, n_class, alpha) -> None:
         super(LabelSmoothLoss, self).__init__()
